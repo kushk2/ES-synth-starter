@@ -6,8 +6,10 @@
 #include <iostream>
 #include <cmath>
 #include <array>
+#include <String>
 
 volatile uint32_t currentStepSize;
+const char* currentNote;
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -48,31 +50,24 @@ U8G2_SSD1305_128X32_NONAME_F_HW_I2C u8g2(U8G2_R0);
 
 //Phase Step Sizes for each of the 12 notes on the keyboard:
 
-
-std::array<uint32_t, numKeys> stepSizes() {
-    std::array<uint32_t, numKeys> result;
-
-    const uint32_t A4_frequency = 440.0; // Reference frequency for A4
-    const double twelfth_root_of_2 = pow(2.0, 1.0 / 12.0); // 12th root of 2
-
-    // Calculate and store phase step sizes for the twelve keys from middle C and up
-    for (int i = 0; i < numKeys; ++i) {
-        uint32_t frequency = A4_frequency * pow(twelfth_root_of_2, i);
-        uint32_t sampling_frequency = 44100.0; // Replace with your actual sampling frequency
-
-        result[i] = static_cast<uint32_t>(pow(2.0, 32) * frequency / sampling_frequency);
-    }
-
-    return result;
-}
-
-const std::array<const char*, numKeys> noteNames = {
-    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+const uint32_t stepSizes[numKeys] = {
+    261, 277, 293, 311, 329, 349, 370, 392, 415, 440, 466, 494
 };
 
-std::string keyIToStr(uint32_t num){
-  return noteNames[num];
-}
+const char* noteNames[12] = {
+    "C",
+    "C#",
+    "D",
+    "D#",
+    "E",
+    "F",
+    "F#",
+    "G",
+    "G#",
+    "A",
+    "A#",
+    "B"
+};
 
 
 //Function to set outputs using key matrix
@@ -86,6 +81,7 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       delayMicroseconds(2);
       digitalWrite(REN_PIN,LOW);
 }
+
 
 std::bitset<4> readCols(){
 
@@ -101,6 +97,8 @@ std::bitset<4> readCols(){
   return result;
 }
 
+
+
 void setRow(uint8_t rowIdx) {
   int RAi_PIN[] = {RA0_PIN, RA1_PIN, RA2_PIN};
 
@@ -114,6 +112,7 @@ void setRow(uint8_t rowIdx) {
 
   digitalWrite(REN_PIN, HIGH);
 }
+
 
 
 void setup() {
@@ -143,8 +142,6 @@ void setup() {
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);  //Enable display power supply
 
-  std::array<uint32_t, numKeys> StepSizesArray = stepSizes();
-
   //Initialise UART
   Serial.begin(9600);
   Serial.println("Hello World");
@@ -162,8 +159,6 @@ void loop() {
   //Update display
   u8g2.clearBuffer();         // clear the internal memory
   u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-  u8g2.drawStr(2,10,"Helllo World!");  // write something to the internal memory
-  u8g2.setCursor(2,20);
   
   std::bitset<32> inputs;
 
@@ -180,6 +175,17 @@ void loop() {
 
   u8g2.setCursor(2,20);
   u8g2.print(inputs.to_ulong(),HEX); 
+  
+  for (int i = 0; i < numKeys; ++i) {
+    if (!inputs[i]) {
+      currentStepSize = stepSizes[i];
+      currentNote = noteNames[i];
+    }
+  }
+  u8g2.setCursor(2,30);
+  u8g2.print("Played:"); 
+  u8g2.setCursor(50,30);
+  u8g2.print(currentNote); 
 
   u8g2.sendBuffer();          // transfer internal memory to the display
 
