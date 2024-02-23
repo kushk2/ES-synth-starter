@@ -182,9 +182,9 @@ void loop() {
       currentNote = noteNames[i];
     }
   }
-  u8g2.setCursor(2,30);
+  u8g2.setCursor(2,10);
   u8g2.print("Played:"); 
-  u8g2.setCursor(50,30);
+  u8g2.setCursor(50,10);
   u8g2.print(currentNote); 
 
   u8g2.sendBuffer();          // transfer internal memory to the display
