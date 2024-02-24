@@ -85,8 +85,8 @@ class Knob{
       }
 
       // Ensure value is within limits
-      //if(value > upperLimit) value = upperLimit;
-      //if(value < lowerLimit) value = lowerLimit;
+      if(value > upperLimit) value = upperLimit;
+      if(value < lowerLimit) value = lowerLimit;
       
       stateBA = newBA;
 
