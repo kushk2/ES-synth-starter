@@ -2,12 +2,16 @@
 #include <U8g2lib.h>
 #include <bitset>
 
+#include <STM32FreeRTOS.h>
+
 //for generating array
 #include <iostream>
 #include <cmath>
 #include <array>
 #include <String>
 
+
+//Current Step Size & Current Note Name
 volatile uint32_t currentStepSize;
 const char* currentNote;
 
@@ -48,10 +52,16 @@ const char* currentNote;
 //Display driver object
 U8G2_SSD1305_128X32_NONAME_F_HW_I2C u8g2(U8G2_R0);
 
+struct {
+  std::bitset<32> inputs; 
+  SemaphoreHandle_t mutex; 
+} sysState;
+
 //Phase Step Sizes for each of the 12 notes on the keyboard:
 
 const uint32_t stepSizes[numKeys] = {
-    261, 277, 293, 311, 329, 349, 370, 392, 415, 440, 466, 494
+    138412872, 146730540, 155548208, 164865876, 174583544, 184801212,
+    195518880, 206736548, 218454216, 230671884, 243389552, 256607220
 };
 
 const char* noteNames[12] = {
@@ -113,6 +123,92 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(REN_PIN, HIGH);
 }
 
+void scanKeysTask(void *pvParameters){
+  const TickType_t xFrequency = 50/portTICK_PERIOD_MS; //initiation interval is 50ms
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  while(1){
+
+    vTaskDelayUntil( &xLastWakeTime, xFrequency ); //waits xfrequency til last loop execution
+
+    int numRowsToRead = 3;
+    for(int i = 0; i < numRowsToRead; i++){
+      setRow(i);
+      delayMicroseconds(3);
+      std::bitset<4> rowResult = readCols();
+
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      for (int j = 0; j < 4; j++) {
+          sysState.inputs[4*i + j] = rowResult[j];
+      }
+      xSemaphoreGive(sysState.mutex);
+    }
+    
+    uint32_t localCurrentStepSize;
+
+    localCurrentStepSize = 0; 
+    bool input_i_state;
+    for (int i = 0; i < numKeys; ++i) {
+
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      input_i_state = sysState.inputs[i];
+      xSemaphoreGive(sysState.mutex);
+
+      if (!input_i_state) {
+        localCurrentStepSize = stepSizes[i];
+        currentNote = noteNames[i];
+      }
+    }
+
+    __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+
+  }
+}
+
+void displayUpdateTask(void *pvParameters){
+  const TickType_t xFrequency = 100/portTICK_PERIOD_MS; //initiation interval is 50ms
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  while(1){
+    vTaskDelayUntil( &xLastWakeTime, xFrequency ); //waits xfrequency til last loop execution
+
+    //Update display
+    u8g2.clearBuffer();         // clear the internal memory
+    u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
+
+    u8g2.setCursor(2,20);
+    
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    u8g2.print(sysState.inputs.to_ulong(),HEX);
+    xSemaphoreGive(sysState.mutex);
+
+    //scanKeysTask(NULL);
+    
+    u8g2.setCursor(2,10);
+    u8g2.print("Played:"); 
+    u8g2.setCursor(45,10);
+    u8g2.print(currentNote);
+
+    u8g2.sendBuffer();          // transfer internal memory to the display
+
+    //Toggle LED
+    digitalToggle(LED_BUILTIN);
+
+  }
+}
+
+
+
+
+static uint32_t phaseAcc = 0;
+
+void sampleISR() {
+  phaseAcc += __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED); //accumulate phase size
+  int32_t Vout = (phaseAcc >> 24) - 128; //set output phase as voltage as per sawtooth, -128 so that the offset=0, for adding other functions etc
+  //Serial.println(phaseAcc);
+  analogWrite(OUTR_PIN, Vout + 128); //add the offset at the end again
+}
+
 
 
 void setup() {
@@ -142,54 +238,46 @@ void setup() {
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);  //Enable display power supply
 
+  //Initialise Hardware Timer
+  TIM_TypeDef *Instance = TIM1;
+  HardwareTimer *sampleTimer = new HardwareTimer(Instance);
+  sampleTimer->setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer->attachInterrupt(sampleISR);
+  sampleTimer->resume();
+
   //Initialise UART
   Serial.begin(9600);
   Serial.println("Hello World");
+
+  //to initilaise and run the thread  
+  TaskHandle_t scanKeysHandle = NULL;
+  xTaskCreate(
+    scanKeysTask,   //Function that implements task
+    "scanKeys",     //text name for the task
+    64,             //Stack Size in WORDS not bites
+    NULL,           //Parameter passed into task
+    2,              //Task priority
+    &scanKeysHandle     
+  );
+
+  TaskHandle_t displayUpdateHandle = NULL;
+  xTaskCreate(
+    displayUpdateTask,   //Function that implements task
+    "displayUpdate",     //text name for the task
+    256,             //Stack Size in WORDS not bites
+    NULL,           //Parameter passed into task
+    1,              //Task priority
+    &displayUpdateHandle     
+  );
+
+  //initialise semaphore
+  sysState.mutex = xSemaphoreCreateMutex();
+
+  //initialise scheduler
+  vTaskStartScheduler();
+
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  static uint32_t next = millis();
-  static uint32_t count = 0;
-
-  while (millis() < next);  //Wait for next interval
-
-  next += interval;
-
-  //Update display
-  u8g2.clearBuffer();         // clear the internal memory
-  u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-  
-  std::bitset<32> inputs;
-
-  int numRowsToRead = 3;
-  for(int i = 0; i < numRowsToRead; i++){
-    setRow(i);
-    delayMicroseconds(3);
-    std::bitset<4> rowResult = readCols();
-
-    for (int j = 0; j < 4; j++) {
-        inputs[4*i + j] = rowResult[j];
-    }
-  }
-
-  u8g2.setCursor(2,20);
-  u8g2.print(inputs.to_ulong(),HEX); 
-  
-  for (int i = 0; i < numKeys; ++i) {
-    if (!inputs[i]) {
-      currentStepSize = stepSizes[i];
-      currentNote = noteNames[i];
-    }
-  }
-  u8g2.setCursor(2,10);
-  u8g2.print("Played:"); 
-  u8g2.setCursor(50,10);
-  u8g2.print(currentNote); 
-
-  u8g2.sendBuffer();          // transfer internal memory to the display
-
-  //Toggle LED
-  digitalToggle(LED_BUILTIN);
   
 }
