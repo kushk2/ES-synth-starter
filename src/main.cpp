@@ -55,7 +55,61 @@ U8G2_SSD1305_128X32_NONAME_F_HW_I2C u8g2(U8G2_R0);
 struct {
   std::bitset<32> inputs; 
   SemaphoreHandle_t mutex; 
+  int32_t knob3Position;
 } sysState;
+
+class Knob{
+  private:
+    int32_t upperLimit;
+    int32_t lowerLimit;
+    int32_t value;
+    std::bitset<2> stateBA;
+
+    SemaphoreHandle_t knobMutex;
+
+  public:
+    Knob(int32_t lowerLim, int32_t upperLim) : value(0), upperLimit(upperLim), lowerLimit(lowerLim), stateBA(0b00){
+      knobMutex = xSemaphoreCreateMutex();
+    }
+
+    void update(std::bitset<2> newBA){
+      xSemaphoreTake(knobMutex, portMAX_DELAY);
+
+      if (newBA != stateBA) {
+        // Check for valid transitions and update the value accordingly
+        if ((stateBA == 0b00 && newBA == 0b01) || (stateBA == 0b11 && newBA == 0b10)) {
+          value--; // Clockwise rotation
+        } else if ((stateBA == 0b01 && newBA == 0b00) || (stateBA == 0b10 && newBA == 0b11)) {
+          value++; // Counterclockwise rotation
+        }
+      }
+
+      // Ensure value is within limits
+      //if(value > upperLimit) value = upperLimit;
+      //if(value < lowerLimit) value = lowerLimit;
+      
+      stateBA = newBA;
+
+      xSemaphoreGive(knobMutex);
+    }
+
+    void setLimits(int32_t lowerLim, int32_t upperLim){
+      xSemaphoreTake(knobMutex, portMAX_DELAY);
+
+      lowerLimit = lowerLim;
+      upperLimit = upperLim;
+
+      xSemaphoreGive(knobMutex);
+    }
+
+    int32_t getPosition() const {
+        return value;
+    }
+
+};
+
+Knob knob3(-8,8);
+
 
 //Phase Step Sizes for each of the 12 notes on the keyboard:
 
@@ -124,14 +178,13 @@ void setRow(uint8_t rowIdx) {
 }
 
 void scanKeysTask(void *pvParameters){
-  const TickType_t xFrequency = 50/portTICK_PERIOD_MS; //initiation interval is 50ms
+  const TickType_t xFrequency = 20/portTICK_PERIOD_MS; //initiation interval is 50ms
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   while(1){
-
     vTaskDelayUntil( &xLastWakeTime, xFrequency ); //waits xfrequency til last loop execution
 
-    int numRowsToRead = 3;
+    int numRowsToRead = 4;
     for(int i = 0; i < numRowsToRead; i++){
       setRow(i);
       delayMicroseconds(3);
@@ -158,9 +211,23 @@ void scanKeysTask(void *pvParameters){
         localCurrentStepSize = stepSizes[i];
         currentNote = noteNames[i];
       }
+
     }
 
     __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+
+    std::bitset<2> newStateBA;
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+       newStateBA[1] = sysState.inputs[12];
+       newStateBA[0] = sysState.inputs[13];
+    xSemaphoreGive(sysState.mutex);
+
+    knob3.update(newStateBA);
+
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    sysState.knob3Position = knob3.getPosition();
+    xSemaphoreGive(sysState.mutex);
+
 
   }
 }
@@ -177,9 +244,9 @@ void displayUpdateTask(void *pvParameters){
     u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
 
     u8g2.setCursor(2,20);
-    
+
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    u8g2.print(sysState.inputs.to_ulong(),HEX);
+    u8g2.print(sysState.knob3Position);
     xSemaphoreGive(sysState.mutex);
 
     //scanKeysTask(NULL);
