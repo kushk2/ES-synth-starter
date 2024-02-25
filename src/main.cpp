@@ -3,6 +3,7 @@
 #include <bitset>
 
 #include <STM32FreeRTOS.h>
+#include <ES_CAN.h>
 
 //for generating array
 #include <iostream>
@@ -14,6 +15,9 @@
 //Current Step Size & Current Note Name
 volatile uint32_t currentStepSize;
 const char* currentNote;
+
+//Outgoing Message
+volatile uint8_t TX_Message[8] = {0};
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -68,7 +72,7 @@ class Knob{
     SemaphoreHandle_t knobMutex;
 
   public:
-    Knob(int32_t lowerLim, int32_t upperLim) : value(0), upperLimit(upperLim), lowerLimit(lowerLim), stateBA(0b00){
+    Knob(int32_t lowerLim, int32_t upperLim) : value(3), upperLimit(upperLim), lowerLimit(lowerLim), stateBA(0b00){
       knobMutex = xSemaphoreCreateMutex();
     }
 
@@ -81,6 +85,11 @@ class Knob{
           value--; // Clockwise rotation
         } else if ((stateBA == 0b01 && newBA == 0b00) || (stateBA == 0b10 && newBA == 0b11)) {
           value++; // Counterclockwise rotation
+        } else if ((stateBA == 0b01 && newBA == 0b00) || (stateBA == 0b10 && newBA == 0b11)) {
+          value--; // Counterclockwise rotation
+        } else if ((stateBA == 0b00 && newBA == 0b11) || (stateBA == 0b11 && newBA == 0b00)) {
+          // Missed state, assume same direction as before
+          value += (value > 0) ? -1 : 1;
         }
       }
 
@@ -108,7 +117,7 @@ class Knob{
 
 };
 
-Knob knob3(-8,8);
+Knob knob3(0,8);
 
 
 //Phase Step Sizes for each of the 12 notes on the keyboard:
@@ -184,43 +193,60 @@ void scanKeysTask(void *pvParameters){
   while(1){
     vTaskDelayUntil( &xLastWakeTime, xFrequency ); //waits xfrequency til last loop execution
 
+    //read rows
     int numRowsToRead = 4;
+    std::bitset<32> newInputs;
+
     for(int i = 0; i < numRowsToRead; i++){
       setRow(i);
       delayMicroseconds(3);
       std::bitset<4> rowResult = readCols();
 
-      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      //populate new inputs after readin
       for (int j = 0; j < 4; j++) {
-          sysState.inputs[4*i + j] = rowResult[j];
+          newInputs[4*i + j] = rowResult[j];
       }
-      xSemaphoreGive(sysState.mutex);
     }
     
-    uint32_t localCurrentStepSize;
+    uint32_t localCurrentStepSize = 0;
+    
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    std::bitset<32> oldInputs = sysState.inputs;
+    xSemaphoreGive(sysState.mutex);
+    //do XOR here to reduce operations in for loop
+    std::bitset<32> keyDiff = oldInputs ^ newInputs;
 
-    localCurrentStepSize = 0; 
-    bool input_i_state;
+    uint8_t local_TX_Message[8];
+
     for (int i = 0; i < numKeys; ++i) {
-
-      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-      input_i_state = sysState.inputs[i];
-      xSemaphoreGive(sysState.mutex);
-
-      if (!input_i_state) {
+      //update step size
+      if (!newInputs[i]) {
         localCurrentStepSize = stepSizes[i];
         currentNote = noteNames[i];
       }
-
+      //since we're iterating over each key anyway, check against old keys here
+      if (keyDiff[i]) {
+        TX_Message[0] = newInputs[i] ? 'R' : 'P'; // 'R' for pressed, 'P' for released
+        TX_Message[1] = 4; // Default octave for now
+        TX_Message[2] = i;
+        
+      }
+      for (int j = 0; j < 8; ++j) {
+        local_TX_Message[j] = TX_Message[j]; // Manually copy each byte
+      }
+      CAN_TX(0x123, local_TX_Message); // Send CAN message with key press/release information
     }
+  
+     //careful about when this happens, risk of it happening before we update step size and something else changing it, but could reduce mutex takes 
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    sysState.inputs = newInputs;
+    xSemaphoreGive(sysState.mutex);
 
     __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
 
     std::bitset<2> newStateBA;
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-       newStateBA[1] = sysState.inputs[12];
-       newStateBA[0] = sysState.inputs[13];
-    xSemaphoreGive(sysState.mutex);
+    newStateBA[1] = newInputs[12];
+    newStateBA[0] = newInputs[13];
 
     knob3.update(newStateBA);
 
@@ -256,6 +282,19 @@ void displayUpdateTask(void *pvParameters){
     u8g2.setCursor(45,10);
     u8g2.print(currentNote);
 
+    //RX Part
+    uint32_t ID = 0x123;
+    uint8_t RX_Message[8]={0};
+
+    while (CAN_CheckRXLevel())
+	      CAN_RX(ID, RX_Message);
+
+    //display TX
+    u8g2.setCursor(66,30);
+    u8g2.print((char) RX_Message[0]);
+    u8g2.print(RX_Message[1]);
+    u8g2.print(RX_Message[2]);
+
     u8g2.sendBuffer();          // transfer internal memory to the display
 
     //Toggle LED
@@ -272,7 +311,7 @@ static uint32_t phaseAcc = 0;
 void sampleISR() {
   phaseAcc += __atomic_load_n(&currentStepSize, __ATOMIC_RELAXED); //accumulate phase size
   int32_t Vout = (phaseAcc >> 24) - 128; //set output phase as voltage as per sawtooth, -128 so that the offset=0, for adding other functions etc
-  //Serial.println(phaseAcc);
+  Vout = Vout >> (8 - __atomic_load_n(&sysState.knob3Position, __ATOMIC_RELAXED));
   analogWrite(OUTR_PIN, Vout + 128); //add the offset at the end again
 }
 
@@ -311,6 +350,11 @@ void setup() {
   sampleTimer->setOverflow(22000, HERTZ_FORMAT);
   sampleTimer->attachInterrupt(sampleISR);
   sampleTimer->resume();
+
+  //Initialise CAN BUS
+  CAN_Init(true);
+  setCANFilter(0x123,0x7ff);
+  CAN_Start();
 
   //Initialise UART
   Serial.begin(9600);
