@@ -11,13 +11,14 @@
 #include <array>
 #include <String>
 
-
 //Current Step Size & Current Note Name
 volatile uint32_t currentStepSize;
 const char* currentNote;
 
-//Outgoing Message
-volatile uint8_t TX_Message[8] = {0};
+uint8_t RX_Message[8] = {0};
+SemaphoreHandle_t RX_Message_Mutex;
+
+QueueHandle_t msgInQ;
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -123,7 +124,7 @@ Knob knob3(0,8);
 //Phase Step Sizes for each of the 12 notes on the keyboard:
 
 const uint32_t stepSizes[numKeys] = {
-    138412872, 146730540, 155548208, 164865876, 174583544, 184801212,
+    2553846121, 146730540, 155548208, 164865876, 174583544, 184801212,
     195518880, 206736548, 218454216, 230671884, 243389552, 256607220
 };
 
@@ -155,22 +156,42 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       digitalWrite(REN_PIN,LOW);
 }
 
+void CAN_RX_ISR (void) {
+	uint32_t ID = 0x123;
+  uint8_t RX_Message_ISR[8];
+  CAN_RX(ID, RX_Message_ISR);
+  xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+}
 
-std::bitset<4> readCols(){
+int octaveN = 4;
+void decodeTask(void *pvParameters){
+  uint8_t RX_Message_Local[8] = {0};
+  while(1){
+    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
+    
+    // if(RX_Message_Local[0] == 'P'){
+    //     int localStepSize = stepSizes[RX_Message_Local[1]] << (octaveN-4);
+    //   __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
+    // }
+    // else if(RX_Message_Local[0] = 'R'){
+    //   __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+    // }
 
-  std::bitset<4> result;
-
-  const int Ci_pin[] = {C0_PIN, C1_PIN, C2_PIN, C3_PIN};
-
-    for(int i = 0; i < size(result); i++){
-
-      result[i] = digitalRead(Ci_pin[i]);
-    }
-  
-  return result;
+    // xSemaphoreTake(RX_Message_Mutex, portMAX_DELAY);
+    // xSemaphoreGive(RX_Message_Mutex);
+  }
 }
 
 
+std::bitset<4> readCols(){
+  std::bitset<4> result;
+  const int Ci_pin[] = {C0_PIN, C1_PIN, C2_PIN, C3_PIN};
+
+    for(int i = 0; i < size(result); i++){
+      result[i] = digitalRead(Ci_pin[i]);
+    }
+  return result;
+}
 
 void setRow(uint8_t rowIdx) {
   int RAi_PIN[] = {RA0_PIN, RA1_PIN, RA2_PIN};
@@ -216,7 +237,6 @@ void scanKeysTask(void *pvParameters){
     //do XOR here to reduce operations in for loop
     std::bitset<32> keyDiff = oldInputs ^ newInputs;
 
-    uint8_t local_TX_Message[8];
 
     for (int i = 0; i < numKeys; ++i) {
       //update step size
@@ -224,15 +244,14 @@ void scanKeysTask(void *pvParameters){
         localCurrentStepSize = stepSizes[i];
         currentNote = noteNames[i];
       }
+
+      uint8_t local_TX_Message[8];
       //since we're iterating over each key anyway, check against old keys here
       if (keyDiff[i]) {
-        TX_Message[0] = newInputs[i] ? 'R' : 'P'; // 'R' for pressed, 'P' for released
-        TX_Message[1] = 4; // Default octave for now
-        TX_Message[2] = i;
+        local_TX_Message[0] = newInputs[i] ? 'R' : 'P'; // 'R' for pressed, 'P' for released
+        local_TX_Message[1] = 4; // Default octave for now
+        local_TX_Message[2] = i;
         
-      }
-      for (int j = 0; j < 8; ++j) {
-        local_TX_Message[j] = TX_Message[j]; // Manually copy each byte
       }
       CAN_TX(0x123, local_TX_Message); // Send CAN message with key press/release information
     }
@@ -253,8 +272,6 @@ void scanKeysTask(void *pvParameters){
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     sysState.knob3Position = knob3.getPosition();
     xSemaphoreGive(sysState.mutex);
-
-
   }
 }
 
@@ -284,17 +301,15 @@ void displayUpdateTask(void *pvParameters){
 
     //RX Part
     uint32_t ID = 0x123;
-    uint8_t RX_Message[8]={0};
-
-    while (CAN_CheckRXLevel())
-	      CAN_RX(ID, RX_Message);
 
     //display TX
     u8g2.setCursor(66,30);
-    u8g2.print((char) RX_Message[0]);
+
+    xSemaphoreTake(RX_Message_Mutex, portMAX_DELAY);
+    u8g2.print((char)RX_Message[0]);
     u8g2.print(RX_Message[1]);
     u8g2.print(RX_Message[2]);
-
+    xSemaphoreGive(RX_Message_Mutex);
     u8g2.sendBuffer();          // transfer internal memory to the display
 
     //Toggle LED
@@ -302,9 +317,6 @@ void displayUpdateTask(void *pvParameters){
 
   }
 }
-
-
-
 
 static uint32_t phaseAcc = 0;
 
@@ -354,7 +366,11 @@ void setup() {
   //Initialise CAN BUS
   CAN_Init(true);
   setCANFilter(0x123,0x7ff);
+  CAN_RegisterRX_ISR(CAN_RX_ISR);
   CAN_Start();
+
+  //Initialise Queue Handler
+  msgInQ = xQueueCreate(36,8);
 
   //Initialise UART
   Serial.begin(9600);
@@ -381,12 +397,22 @@ void setup() {
     &displayUpdateHandle     
   );
 
+  TaskHandle_t decodeHandle = NULL;
+  xTaskCreate(
+    decodeTask,   //Function that implements task
+    "decode",     //text name for the task
+    32,             //Stack Size in WORDS not bites -- check if this is enough
+    NULL,           //Parameter passed into task
+    1,              //Task priority
+    &decodeHandle     
+  );
+
   //initialise semaphore
   sysState.mutex = xSemaphoreCreateMutex();
+  RX_Message_Mutex = xSemaphoreCreateMutex();
 
   //initialise scheduler
   vTaskStartScheduler();
-
 }
 
 void loop() {
