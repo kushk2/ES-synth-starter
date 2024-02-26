@@ -167,7 +167,13 @@ int octaveN = 4;
 void decodeTask(void *pvParameters){
   uint8_t RX_Message_Local[8] = {0};
   while(1){
-    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
+    xQueueReceive(msgInQ, RX_Message_Local, portMAX_DELAY);
+
+    xSemaphoreTake(RX_Message_Mutex, portMAX_DELAY);
+    for(int i = 0; i < std::size(RX_Message); i++){
+      RX_Message[i] = RX_Message_Local[i];
+    }
+    xSemaphoreGive(RX_Message_Mutex);
     
     // if(RX_Message_Local[0] == 'P'){
     //     int localStepSize = stepSizes[RX_Message_Local[1]] << (octaveN-4);
@@ -176,9 +182,7 @@ void decodeTask(void *pvParameters){
     // else if(RX_Message_Local[0] = 'R'){
     //   __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
     // }
-
-    // xSemaphoreTake(RX_Message_Mutex, portMAX_DELAY);
-    // xSemaphoreGive(RX_Message_Mutex);
+    
   }
 }
 
