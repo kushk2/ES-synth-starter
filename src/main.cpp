@@ -21,7 +21,10 @@ const char* currentNote;
 uint8_t RX_Message[8] = {0};
 SemaphoreHandle_t RX_Message_Mutex;
 
+SemaphoreHandle_t CAN_TX_Sempahore;
+
 QueueHandle_t msgInQ;
+QueueHandle_t msgOutQ;
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -159,6 +162,19 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       digitalWrite(REN_PIN,LOW);
 }
 
+void CAN_TX_Task(void *pvParameters){
+  uint8_t msgOut[8];
+  while(1){
+    xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+    xSemaphoreTake(CAN_TX_Sempahore, portMAX_DELAY);
+    CAN_TX(0x123, msgOut);
+  }
+}
+
+void CAN_TX_ISR(void){
+  xSemaphoreGiveFromISR(CAN_TX_Sempahore, NULL);
+}
+
 void CAN_RX_ISR (void) {
 	uint32_t ID = 0x123;
   uint8_t RX_Message_ISR[8];
@@ -178,13 +194,13 @@ void decodeTask(void *pvParameters){
     }
     xSemaphoreGive(RX_Message_Mutex);
     
-    // if(RX_Message_Local[0] == 'P'){
-    //     int localStepSize = stepSizes[RX_Message_Local[1]] << (octaveN-4);
-    //   __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
-    // }
-    // else if(RX_Message_Local[0] = 'R'){
-    //   __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
-    // }
+    if(RX_Message_Local[0] == 'P'){
+        int localStepSize = stepSizes[RX_Message_Local[2]] << (octaveN-4);
+      __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
+    }
+    else if(RX_Message_Local[0] = 'R'){
+      __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+    }
     
   }
 }
@@ -446,6 +462,9 @@ void setup() {
   //Initialise Queue Handler
   msgInQ = xQueueCreate(36,8);
   msgOutQ = xQueueCreate(36,8);
+  #ifdef DISABLE_THREADS
+    msgOutQ = xQueueCreate(384,8); //to fit 32 iterations
+  #endif
 
   //Initialise UART
   Serial.begin(9600);
@@ -475,33 +494,32 @@ void setup() {
       &displayUpdateHandle     
     );
 
-  TaskHandle_t decodeHandle = NULL;
-  xTaskCreate(
-    decodeTask,   //Function that implements task
-    "decode",     //text name for the task
-    32,             //Stack Size in WORDS not bites -- check if this is enough
-    NULL,           //Parameter passed into task
-    1,              //Task priority
-    &decodeHandle     
-  );
+    TaskHandle_t decodeHandle = NULL;
+    xTaskCreate(
+      decodeTask,   //Function that implements task
+      "decode",     //text name for the task
+      32,             //Stack Size in WORDS not bites -- check if this is enough
+      NULL,           //Parameter passed into task
+      1,              //Task priority
+      &decodeHandle     
+    );
 
-  TaskHandle_t CAN_TX_Handle = NULL;
-  xTaskCreate(
-    CAN_TX_Task,   //Function that implements task
-    "CAN_TX",     //text name for the task
-    32,             //Stack Size in WORDS not bites -- check if this is enough
-    NULL,           //Parameter passed into task
-    1,              //Task priority
-    &CAN_TX_Handle     
-  );
-
-  #endif
+    TaskHandle_t CAN_TX_Handle = NULL;
+    xTaskCreate(
+      CAN_TX_Task,   //Function that implements task
+      "CAN_TX",     //text name for the task
+      32,             //Stack Size in WORDS not bites -- check if this is enough
+      NULL,           //Parameter passed into task
+      1,              //Task priority
+      &CAN_TX_Handle     
+    );
 
   #endif
 
   //initialise semaphore
   sysState.mutex = xSemaphoreCreateMutex();
   RX_Message_Mutex = xSemaphoreCreateMutex();
+  CAN_TX_Sempahore = xSemaphoreCreateCounting(3,3);
 
   //initialise scheduler
   #ifndef DISABLE_THREADS
