@@ -11,6 +11,9 @@
 #include <array>
 #include <String>
 
+#define DISABLE_THREADS
+#define TEST_SCANKEYS //for timing purposes
+
 //Current Step Size & Current Note Name
 volatile uint32_t currentStepSize;
 const char* currentNote;
@@ -202,8 +205,6 @@ void decodeTask(void *pvParameters){
   }
 }
 
-
-
 std::bitset<4> readCols(){
   std::bitset<4> result;
   const int Ci_pin[] = {C0_PIN, C1_PIN, C2_PIN, C3_PIN};
@@ -229,72 +230,136 @@ void setRow(uint8_t rowIdx) {
 }
 
 void scanKeysTask(void *pvParameters){
-  const TickType_t xFrequency = 20/portTICK_PERIOD_MS; //initiation interval is 50ms
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+  #ifndef DISABLE_THREADS 
+    const TickType_t xFrequency = 20/portTICK_PERIOD_MS; //initiation interval is 50ms
+    TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  while(1){
-    vTaskDelayUntil( &xLastWakeTime, xFrequency ); //waits xfrequency til last loop execution
+    while(1){
+      vTaskDelayUntil( &xLastWakeTime, xFrequency ); //waits xfrequency til last loop execution
 
-    //read rows
-    int numRowsToRead = 4;
-    std::bitset<32> newInputs;
+      //read rows
+      int numRowsToRead = 4;
+      std::bitset<32> newInputs;
 
-    for(int i = 0; i < numRowsToRead; i++){
-      setRow(i);
-      delayMicroseconds(3);
-      std::bitset<4> rowResult = readCols();
+      for(int i = 0; i < numRowsToRead; i++){
+        setRow(i);
+        delayMicroseconds(3);
+        std::bitset<4> rowResult = readCols();
 
-      //populate new inputs after readin
-      for (int j = 0; j < 4; j++) {
-          newInputs[4*i + j] = rowResult[j];
+        //populate new inputs after readin
+        for (int j = 0; j < 4; j++) {
+            newInputs[4*i + j] = rowResult[j];
+        }
       }
-    }
+      
+      uint32_t localCurrentStepSize = 0;
+      
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      std::bitset<32> oldInputs = sysState.inputs;
+      xSemaphoreGive(sysState.mutex);
+      //do XOR here to reduce operations in for loop
+      std::bitset<32> keyDiff = oldInputs ^ newInputs;
+
+
+      for (int i = 0; i < numKeys; ++i) {
+        //update step size
+        if (!newInputs[i]) {
+          localCurrentStepSize = stepSizes[i];
+          currentNote = noteNames[i];
+        }
+
+        uint8_t local_TX_Message[8];
+        //since we're iterating over each key anyway, check against old keys here
+        if (keyDiff[i]) {
+          local_TX_Message[0] = newInputs[i] ? 'R' : 'P'; // 'R' for pressed, 'P' for released
+          local_TX_Message[1] = 4; // Default octave for now
+          local_TX_Message[2] = i;
+          
+        }
+        //CAN_TX(0x123, local_TX_Message); // Send CAN message with key press/release information
+        xQueueSend(msgOutQ, local_TX_Message, portMAX_DELAY);
+      }
     
-    uint32_t localCurrentStepSize = 0;
+      //careful about when this happens, risk of it happening before we update step size and something else changing it, but could reduce mutex takes 
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      sysState.inputs = newInputs;
+      xSemaphoreGive(sysState.mutex);
+
+      __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+
+      std::bitset<2> newStateBA;
+      newStateBA[1] = newInputs[12];
+      newStateBA[0] = newInputs[13];
+
+      knob3.update(newStateBA);
+
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      sysState.knob3Position = knob3.getPosition();
+      xSemaphoreGive(sysState.mutex);
+    #endif
+    #ifdef DISABLE_THREADS
+      int numRowsToRead = 4;
+      std::bitset<32> newInputs;
+
+      for(int i = 0; i < numRowsToRead; i++){
+        setRow(i);
+        delayMicroseconds(3);
+        std::bitset<4> rowResult = readCols();
+
+        //populate new inputs after readin
+        for (int j = 0; j < 4; j++) {
+            newInputs[4*i + j] = rowResult[j];
+        }
+      }
+      
+      uint32_t localCurrentStepSize = 0;
+      
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      std::bitset<32> oldInputs = sysState.inputs;
+      xSemaphoreGive(sysState.mutex);
+      //do XOR here to reduce operations in for loop
+      std::bitset<32> keyDiff = oldInputs ^ newInputs;
+
+
+      for (int i = 0; i < numKeys; ++i) {
+        //update step size
+        if (1) {
+          localCurrentStepSize = stepSizes[i];
+          currentNote = noteNames[i];
+        }
+
+        uint8_t local_TX_Message[8];
+        //since we're iterating over each key anyway, check against old keys here
+        if (1) {
+          local_TX_Message[0] = newInputs[i] ? 'R' : 'P'; // 'R' for pressed, 'P' for released
+          local_TX_Message[1] = 4; // Default octave for now
+          local_TX_Message[2] = i;
+          
+        }
+        //CAN_TX(0x123, local_TX_Message); // Send CAN message with key press/release information
+        xQueueSend(msgOutQ, local_TX_Message, portMAX_DELAY);
+      }
     
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    std::bitset<32> oldInputs = sysState.inputs;
-    xSemaphoreGive(sysState.mutex);
-    //do XOR here to reduce operations in for loop
-    std::bitset<32> keyDiff = oldInputs ^ newInputs;
+      //careful about when this happens, risk of it happening before we update step size and something else changing it, but could reduce mutex takes 
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      sysState.inputs = newInputs;
+      xSemaphoreGive(sysState.mutex);
 
+      __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
 
-    for (int i = 0; i < numKeys; ++i) {
-      //update step size
-      if (!newInputs[i]) {
-        localCurrentStepSize = stepSizes[i];
-        currentNote = noteNames[i];
-      }
+      std::bitset<2> newStateBA;
+      newStateBA[1] = newInputs[12];
+      newStateBA[0] = newInputs[13];
 
-      uint8_t local_TX_Message[8];
-      //since we're iterating over each key anyway, check against old keys here
-      if (keyDiff[i]) {
-        local_TX_Message[0] = newInputs[i] ? 'R' : 'P'; // 'R' for pressed, 'P' for released
-        local_TX_Message[1] = 4; // Default octave for now
-        local_TX_Message[2] = i;
-        
-      }
-      //CAN_TX(0x123, local_TX_Message); // Send CAN message with key press/release information
-      xQueueSend(msgOutQ, local_TX_Message, portMAX_DELAY);
-    }
-  
-     //careful about when this happens, risk of it happening before we update step size and something else changing it, but could reduce mutex takes 
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    sysState.inputs = newInputs;
-    xSemaphoreGive(sysState.mutex);
+      knob3.update(newStateBA);
 
-    __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
-
-    std::bitset<2> newStateBA;
-    newStateBA[1] = newInputs[12];
-    newStateBA[0] = newInputs[13];
-
-    knob3.update(newStateBA);
-
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    sysState.knob3Position = knob3.getPosition();
-    xSemaphoreGive(sysState.mutex);
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      sysState.knob3Position = knob3.getPosition();
+      xSemaphoreGive(sysState.mutex);
+    #endif
+    #ifndef DISABLE_THREADS
   }
+  #endif
 }
 
 void displayUpdateTask(void *pvParameters){
@@ -388,13 +453,18 @@ void setup() {
   //Initialise CAN BUS
   CAN_Init(true);
   setCANFilter(0x123,0x7ff);
-  CAN_RegisterRX_ISR(CAN_RX_ISR);
-  CAN_RegisterTX_ISR(CAN_TX_ISR);
+  #ifndef DISABLE_THREADS
+    CAN_RegisterRX_ISR(CAN_RX_ISR);
+    CAN_RegisterTX_ISR(CAN_TX_ISR);
+  #endif
   CAN_Start();
 
   //Initialise Queue Handler
   msgInQ = xQueueCreate(36,8);
   msgOutQ = xQueueCreate(36,8);
+  #ifdef DISABLE_THREADS
+    msgOutQ = xQueueCreate(384,8); //to fit 32 iterations
+  #endif
 
   //Initialise UART
   Serial.begin(9600);
@@ -402,44 +472,49 @@ void setup() {
 
   //to initilaise and run the thread  
   TaskHandle_t scanKeysHandle = NULL;
-  xTaskCreate(
-    scanKeysTask,   //Function that implements task
-    "scanKeys",     //text name for the task
-    64,             //Stack Size in WORDS not bites
-    NULL,           //Parameter passed into task
-    2,              //Task priority
-    &scanKeysHandle     
-  );
+  
+  #ifndef DISABLE_THREADS
 
-  TaskHandle_t displayUpdateHandle = NULL;
-  xTaskCreate(
-    displayUpdateTask,   //Function that implements task
-    "displayUpdate",     //text name for the task
-    256,             //Stack Size in WORDS not bites
-    NULL,           //Parameter passed into task
-    1,              //Task priority
-    &displayUpdateHandle     
-  );
+    xTaskCreate(
+      scanKeysTask,   //Function that implements task
+      "scanKeys",     //text name for the task
+      64,             //Stack Size in WORDS not bites
+      NULL,           //Parameter passed into task
+      2,              //Task priority
+      &scanKeysHandle     
+    );
 
-  TaskHandle_t decodeHandle = NULL;
-  xTaskCreate(
-    decodeTask,   //Function that implements task
-    "decode",     //text name for the task
-    32,             //Stack Size in WORDS not bites -- check if this is enough
-    NULL,           //Parameter passed into task
-    1,              //Task priority
-    &decodeHandle     
-  );
+    TaskHandle_t displayUpdateHandle = NULL;
+    xTaskCreate(
+      displayUpdateTask,   //Function that implements task
+      "displayUpdate",     //text name for the task
+      256,             //Stack Size in WORDS not bites
+      NULL,           //Parameter passed into task
+      1,              //Task priority
+      &displayUpdateHandle     
+    );
 
-  TaskHandle_t CAN_TX_Handle = NULL;
-  xTaskCreate(
-    CAN_TX_Task,   //Function that implements task
-    "CAN_TX",     //text name for the task
-    32,             //Stack Size in WORDS not bites -- check if this is enough
-    NULL,           //Parameter passed into task
-    1,              //Task priority
-    &CAN_TX_Handle     
-  );
+    TaskHandle_t decodeHandle = NULL;
+    xTaskCreate(
+      decodeTask,   //Function that implements task
+      "decode",     //text name for the task
+      32,             //Stack Size in WORDS not bites -- check if this is enough
+      NULL,           //Parameter passed into task
+      1,              //Task priority
+      &decodeHandle     
+    );
+
+    TaskHandle_t CAN_TX_Handle = NULL;
+    xTaskCreate(
+      CAN_TX_Task,   //Function that implements task
+      "CAN_TX",     //text name for the task
+      32,             //Stack Size in WORDS not bites -- check if this is enough
+      NULL,           //Parameter passed into task
+      1,              //Task priority
+      &CAN_TX_Handle     
+    );
+
+  #endif
 
   //initialise semaphore
   sysState.mutex = xSemaphoreCreateMutex();
@@ -447,7 +522,18 @@ void setup() {
   CAN_TX_Sempahore = xSemaphoreCreateCounting(3,3);
 
   //initialise scheduler
-  vTaskStartScheduler();
+  #ifndef DISABLE_THREADS
+    vTaskStartScheduler();
+  #endif
+  #ifdef TEST_SCANKEYS
+    Serial.println("Starting Test ScanKeys()");
+    uint32_t startTime = micros();
+    for (int iter = 0; iter < 32; iter++) {
+      scanKeysTask(nullptr);
+    }
+    Serial.println(micros()-startTime);
+    while(1);
+  #endif
 }
 
 void loop() {
