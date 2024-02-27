@@ -18,10 +18,7 @@ const char* currentNote;
 uint8_t RX_Message[8] = {0};
 SemaphoreHandle_t RX_Message_Mutex;
 
-SemaphoreHandle_t CAN_TX_Sempahore;
-
 QueueHandle_t msgInQ;
-QueueHandle_t msgOutQ;
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -159,19 +156,6 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       digitalWrite(REN_PIN,LOW);
 }
 
-void CAN_TX_Task(void *pvParameters){
-  uint8_t msgOut[8];
-  while(1){
-    xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
-    xSemaphoreTake(CAN_TX_Sempahore, portMAX_DELAY);
-    CAN_TX(0x123, msgOut);
-  }
-}
-
-void CAN_TX_ISR(void){
-  xSemaphoreGiveFromISR(CAN_TX_Sempahore, NULL);
-}
-
 void CAN_RX_ISR (void) {
 	uint32_t ID = 0x123;
   uint8_t RX_Message_ISR[8];
@@ -191,17 +175,16 @@ void decodeTask(void *pvParameters){
     }
     xSemaphoreGive(RX_Message_Mutex);
     
-    if(RX_Message_Local[0] == 'P'){
-        int localStepSize = stepSizes[RX_Message_Local[2]] << (octaveN-4);
-      __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
-    }
-    else if(RX_Message_Local[0] = 'R'){
-      __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
-    }
+    // if(RX_Message_Local[0] == 'P'){
+    //     int localStepSize = stepSizes[RX_Message_Local[1]] << (octaveN-4);
+    //   __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
+    // }
+    // else if(RX_Message_Local[0] = 'R'){
+    //   __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+    // }
     
   }
 }
-
 
 
 std::bitset<4> readCols(){
@@ -274,8 +257,7 @@ void scanKeysTask(void *pvParameters){
         local_TX_Message[2] = i;
         
       }
-      //CAN_TX(0x123, local_TX_Message); // Send CAN message with key press/release information
-      xQueueSend(msgOutQ, local_TX_Message, portMAX_DELAY);
+      CAN_TX(0x123, local_TX_Message); // Send CAN message with key press/release information
     }
   
      //careful about when this happens, risk of it happening before we update step size and something else changing it, but could reduce mutex takes 
@@ -389,12 +371,10 @@ void setup() {
   CAN_Init(true);
   setCANFilter(0x123,0x7ff);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
-  CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_Start();
 
   //Initialise Queue Handler
   msgInQ = xQueueCreate(36,8);
-  msgOutQ = xQueueCreate(36,8);
 
   //Initialise UART
   Serial.begin(9600);
@@ -431,20 +411,9 @@ void setup() {
     &decodeHandle     
   );
 
-  TaskHandle_t CAN_TX_Handle = NULL;
-  xTaskCreate(
-    CAN_TX_Task,   //Function that implements task
-    "CAN_TX",     //text name for the task
-    32,             //Stack Size in WORDS not bites -- check if this is enough
-    NULL,           //Parameter passed into task
-    1,              //Task priority
-    &CAN_TX_Handle     
-  );
-
   //initialise semaphore
   sysState.mutex = xSemaphoreCreateMutex();
   RX_Message_Mutex = xSemaphoreCreateMutex();
-  CAN_TX_Sempahore = xSemaphoreCreateCounting(3,3);
 
   //initialise scheduler
   vTaskStartScheduler();
